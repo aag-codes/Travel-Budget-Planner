@@ -1,5 +1,4 @@
 requests
-pandas
-streamlit
 python-dotenv
-google-generativeai
+google-genai
+streamlit

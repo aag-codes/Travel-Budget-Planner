@@ -61,4 +61,5 @@ class TripBudget:
             "remaining_budget": self.get_remaining_budget(),
             "number_of_expenses": len(self.expenses),
             "expenses_by_category": self.get_expenses_by_category(),
-        }s
+            
+        }
