@@ -1,10 +1,13 @@
 import streamlit as st
 import pandas as pd
+from datetime import date
 
-from trip_budget import TripBudget
+from trip_budget import TripBudget, TripComparison
 from budget_report import BudgetReport
 from holiday_ai import HolidayAI
+from holiday_checker import HolidayChecker
 from currency_converter import CurrencyConverter
+from exceptions import WayfareError
 
 # --------------------------------------------------------------------------
 # Page config
@@ -244,10 +247,13 @@ def render_setup_screen():
                         trip_name=trip_name.strip(),
                         total_budget=total_budget,
                         base_currency=base_currency,
+                        duration_days=int(duration_days),
                     )
                     st.session_state.trip_duration = int(duration_days)
                     mark_stale()
                     st.rerun()
+                except WayfareError as e:
+                    st.error(f"Couldn't start your trip: {e}")
                 except ValueError as e:
                     st.error(f"Couldn't start your trip: {e}")
 
@@ -326,10 +332,13 @@ def render_sidebar():
             elif amount <= 0:
                 st.sidebar.error("Amount must be greater than zero.")
             else:
-                trip.add_expense(description.strip(), amount, currency, category)
-                mark_stale()
-                st.sidebar.success(f"Added: {description.strip()}")
-                st.rerun()
+                try:
+                    trip.add_expense(description.strip(), amount, currency, category)
+                    mark_stale()
+                    st.sidebar.success(f"Added: {description.strip()}")
+                    st.rerun()
+                except WayfareError as e:
+                    st.sidebar.error(f"Couldn't add expense: {e}")
 
     st.sidebar.markdown("<hr class='wf-divider'>", unsafe_allow_html=True)
     if st.sidebar.button("🔁 Start a new trip", use_container_width=True):
@@ -378,6 +387,34 @@ def render_overview_tab():
 
     st.markdown("<hr class='wf-divider'>", unsafe_allow_html=True)
 
+    st.markdown('<div class="wf-eyebrow">Pacing</div>', unsafe_allow_html=True)
+    st.subheader("Daily spending limit")
+    daily_status = summary["daily_spending_status"]
+
+    dcol1, dcol2, dcol3 = st.columns(3)
+    dcol1.metric("Planned Daily Limit", f"{summary['daily_limit']:.2f} {summary['base_currency']}/day")
+    dcol2.metric("Average So Far", f"{daily_status['avg_daily_spend']:.2f} {summary['base_currency']}/day")
+    dcol3.metric(
+        "Suggested for Remaining Days",
+        f"{daily_status['suggested_remaining_daily_budget']:.2f} {summary['base_currency']}/day",
+    )
+
+    if daily_status["days_elapsed"] > 0:
+        if daily_status["is_over_daily_pace"]:
+            st.warning(
+                f"You're averaging {daily_status['avg_daily_spend']:.2f} {summary['base_currency']}/day, "
+                f"above your {summary['daily_limit']:.2f}/day plan. "
+                f"You have {daily_status['days_remaining']} day(s) left — "
+                f"aim for {daily_status['suggested_remaining_daily_budget']:.2f} {summary['base_currency']}/day from here to recover."
+            )
+        else:
+            st.success(
+                f"You're on pace — averaging {daily_status['avg_daily_spend']:.2f} {summary['base_currency']}/day "
+                f"against a {summary['daily_limit']:.2f}/day plan."
+            )
+
+    st.markdown("<hr class='wf-divider'>", unsafe_allow_html=True)
+
     left, right = st.columns([1, 1])
 
     with left:
@@ -420,13 +457,33 @@ def render_report_tab():
     st.subheader("Trip budget report")
     st.text(report_text)
 
-    st.download_button(
-        "⬇ Download report (.txt)",
-        data=report_text,
-        file_name=f"{trip.trip_name.replace(' ', '_')}_budget_report.txt",
-        mime="text/plain",
-        use_container_width=True,
-    )
+    safe_name = trip.trip_name.replace(" ", "_")
+
+    dl1, dl2, dl3 = st.columns(3)
+    with dl1:
+        st.download_button(
+            "⬇ Download report (.txt)",
+            data=report_text,
+            file_name=f"{safe_name}_budget_report.txt",
+            mime="text/plain",
+            use_container_width=True,
+        )
+    with dl2:
+        st.download_button(
+            "⬇ Download report (.json)",
+            data=report.to_json(),
+            file_name=f"{safe_name}_budget_report.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+    with dl3:
+        st.download_button(
+            "⬇ Download expenses (.csv)",
+            data=report.to_csv(),
+            file_name=f"{safe_name}_expenses.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
 
 
 def _is_transient_ai_error(error: Exception) -> bool:
@@ -524,6 +581,145 @@ def render_ai_tab():
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Tab 4: Compare two destinations
+# --------------------------------------------------------------------------
+def render_compare_tab():
+    st.markdown('<div class="wf-eyebrow">Decide between two trips</div>', unsafe_allow_html=True)
+    st.subheader("⚖️ Compare destinations")
+    st.caption(
+        "Enter your best estimate of the total cost for each destination, in whatever "
+        "currency you have a number for — we'll convert both to a common currency to compare."
+    )
+
+    with st.form("compare_form"):
+        comparison_currency = st.selectbox(
+            "Compare costs in", COMMON_CURRENCIES, index=0, key="compare_currency"
+        )
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.markdown("**Destination A**")
+            name_a = st.text_input("Name", placeholder="e.g. Lisbon", key="compare_name_a")
+            cost_a = st.number_input(
+                "Estimated total cost", min_value=0.0, step=50.0, format="%.2f", key="compare_cost_a"
+            )
+            currency_a = st.selectbox("Currency", COMMON_CURRENCIES, index=0, key="compare_currency_a")
+        with col_b:
+            st.markdown("**Destination B**")
+            name_b = st.text_input("Name", placeholder="e.g. Bangkok", key="compare_name_b")
+            cost_b = st.number_input(
+                "Estimated total cost", min_value=0.0, step=50.0, format="%.2f", key="compare_cost_b"
+            )
+            currency_b = st.selectbox("Currency", COMMON_CURRENCIES, index=1, key="compare_currency_b")
+
+        compare_clicked = st.form_submit_button("Compare", use_container_width=True)
+
+    if compare_clicked:
+        if not name_a.strip() or not name_b.strip():
+            st.error("Please name both destinations.")
+        elif cost_a <= 0 or cost_b <= 0:
+            st.error("Both estimated costs must be greater than zero.")
+        else:
+            with st.spinner("Converting and comparing..."):
+                try:
+                    comparison = TripComparison(comparison_currency)
+                    result = comparison.compare(
+                        name_a.strip(), cost_a, currency_a,
+                        name_b.strip(), cost_b, currency_b,
+                    )
+                except WayfareError as e:
+                    st.error(f"Couldn't compare these destinations: {e}")
+                except Exception as e:
+                    st.error(f"Couldn't compare these destinations: {e}")
+                else:
+                    opt_a, opt_b = result["option_a"], result["option_b"]
+                    ccol1, ccol2 = st.columns(2)
+                    ccol1.metric(
+                        opt_a["name"],
+                        f"{opt_a['converted_amount']:.2f} {result['comparison_currency']}",
+                        help=f"Original: {opt_a['original_amount']:.2f} {opt_a['original_currency']}",
+                    )
+                    ccol2.metric(
+                        opt_b["name"],
+                        f"{opt_b['converted_amount']:.2f} {result['comparison_currency']}",
+                        help=f"Original: {opt_b['original_amount']:.2f} {opt_b['original_currency']}",
+                    )
+
+                    if result["cheaper_option"]:
+                        st.success(
+                            f"**{result['cheaper_option']}** is cheaper by "
+                            f"{result['difference']:.2f} {result['comparison_currency']}."
+                        )
+                    else:
+                        st.info("Both destinations cost the same once converted.")
+
+
+# --------------------------------------------------------------------------
+# Tab 5: Public holiday check
+# --------------------------------------------------------------------------
+def render_holidays_tab():
+    st.markdown('<div class="wf-eyebrow">Plan around holidays</div>', unsafe_allow_html=True)
+    st.subheader("📅 Public holiday check")
+    st.caption(
+        "Check whether your travel dates fall on a public holiday at your destination — "
+        "useful for knowing if banks, offices, or attractions might be closed."
+    )
+
+    checker = HolidayChecker()
+
+    with st.form("holiday_form"):
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            country_code = st.text_input(
+                "Destination country code (2 letters)",
+                placeholder="e.g. US, GB, NG, FR",
+                key="holiday_country",
+            ).strip().upper()
+        with col2:
+            start = st.date_input("Trip start date", value=date.today(), key="holiday_start")
+
+        duration = st.number_input(
+            "Trip duration (days)",
+            min_value=1,
+            step=1,
+            value=st.session_state.trip_duration,
+            key="holiday_duration",
+        )
+
+        check_clicked = st.form_submit_button("Check for holidays", use_container_width=True)
+
+    if check_clicked:
+        if not country_code:
+            st.error("Enter a destination country code.")
+        elif len(country_code) != 2 or not country_code.isalpha():
+            st.error("Country code must be exactly 2 letters, e.g. US, GB, NG.")
+        else:
+            with st.spinner("Checking the holiday calendar..."):
+                try:
+                    holidays = checker.check_trip_dates(start, int(duration), country_code)
+                except WayfareError as e:
+                    st.error(f"Couldn't check holidays: {e}")
+                except ValueError as e:
+                    st.error(f"Couldn't check holidays: {e}")
+                else:
+                    if not holidays:
+                        st.success(
+                            f"No public holidays in {country_code} during your trip "
+                            f"({start} for {int(duration)} day(s)). 🎉"
+                        )
+                    else:
+                        st.warning(
+                            f"Your trip overlaps with {len(holidays)} public holiday(s) in {country_code}:"
+                        )
+                        for h in holidays:
+                            label = h.get("localName") or h.get("name") or "Public holiday"
+                            st.markdown(f"- **{h['date']}** — {label}")
+                        st.caption(
+                            "Banks, government offices, and some businesses may be closed on these dates."
+                        )
+
+
 def main():
     if st.session_state.trip is None:
         render_setup_screen()
@@ -535,8 +731,8 @@ def main():
     st.markdown('<div class="wf-eyebrow">Wayfare</div>', unsafe_allow_html=True)
     st.title(f"🧭 {trip.trip_name}")
 
-    overview_tab, report_tab, ai_tab = st.tabs(
-        ["📊 Overview", "📄 Report", "✨ AI Assistant"]
+    overview_tab, report_tab, ai_tab, compare_tab, holidays_tab = st.tabs(
+        ["📊 Overview", "📄 Report", "✨ AI Assistant", "⚖️ Compare", "📅 Holidays"]
     )
 
     with overview_tab:
@@ -545,6 +741,10 @@ def main():
         render_report_tab()
     with ai_tab:
         render_ai_tab()
+    with compare_tab:
+        render_compare_tab()
+    with holidays_tab:
+        render_holidays_tab()
 
 
 if __name__ == "__main__":
