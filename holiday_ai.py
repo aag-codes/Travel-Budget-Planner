@@ -13,7 +13,7 @@ class HolidayAI:
             raise ValueError("GEMINI_API_KEY not found in environment variables.")
         self.client = genai.Client(api_key=self.api_key)
 
-    def get_travel_advice(self, destination: str, budget: float, currency: str) -> str:
+    def get_travel_advice(self, destination: str, budget: float, currency: str) -> str | None:
         prompt = f"""
         I am planning a trip to {destination} with a budget of {budget} {currency}.
         Please give me:
@@ -25,7 +25,7 @@ class HolidayAI:
         response = self.client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
         return response.text
 
-    def get_packing_suggestions(self, destination: str, duration_days: int) -> str:
+    def get_packing_suggestions(self, destination: str, duration_days: int) -> str | None:
         prompt = f"""
         I am travelling to {destination} for {duration_days} days.
         Give me a concise packing list covering:
@@ -36,7 +36,7 @@ class HolidayAI:
         response = self.client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
         return response.text
 
-    def get_budget_breakdown_advice(self, destination: str, budget: float, currency: str) -> str:
+    def get_budget_breakdown_advice(self, destination: str, budget: float, currency: str) -> str | None:
         prompt = f"""
         I have a total travel budget of {budget} {currency} for a trip to {destination}.
         Suggest a realistic budget breakdown across these categories:
