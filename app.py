@@ -1,3 +1,5 @@
+import re
+
 import streamlit as st
 import pandas as pd
 from datetime import date
@@ -8,6 +10,7 @@ from holiday_ai import HolidayAI
 from holiday_checker import HolidayChecker
 from currency_converter import CurrencyConverter
 from exceptions import WayfareError
+from validators import extract_price_from_text, extract_currency_code_from_text, PRICE_PATTERN
 
 # --------------------------------------------------------------------------
 # Page config
@@ -188,6 +191,22 @@ if "summary_cache" not in st.session_state:
     st.session_state.summary_cache = None
 if "summary_stale" not in st.session_state:
     st.session_state.summary_stale = True
+if "destination_currency" not in st.session_state:
+    st.session_state.destination_currency = COMMON_CURRENCIES[1]
+if "quick_add_version" not in st.session_state:
+    st.session_state.quick_add_version = 0
+
+# Backing state for the sidebar "Add an expense" form fields. Keeping these
+# as named keys (rather than letting the widgets manage their own state)
+# is what lets the quick-add free-text parser below pre-fill the form.
+# Backing state for the sidebar "Add an expense" form fields. The fields use
+# versioned keys (exp_description_<v>, exp_amount_<v>, ...) rather than fixed
+# ones: Streamlit forbids writing to st.session_state[key] for a widget that
+# has already been instantiated in the current run, so to both (a) let the
+# quick-add parser pre-fill the form, and (b) clear the form after a
+# successful submit, each "reset" bumps this version, which gives the
+# widgets brand-new (and therefore blank/default) keys on the next rerun.
+st.session_state.setdefault("expense_form_version", 0)
 
 
 def mark_stale():
@@ -204,6 +223,18 @@ def get_summary():
     return st.session_state.summary_cache
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_exchange_rate(base_currency: str, target_currency: str) -> float:
+    """
+    Looks up the exchange rate for a currency pair, cached for 5 minutes.
+    Caching by currency pair (not by amount) means the live setup-screen
+    conversion can recompute on every keystroke locally - amount * rate -
+    without firing a fresh API call each time the budget field changes.
+    """
+    converter = CurrencyConverter()
+    return converter.get_exchange_rate(base_currency, target_currency)
+
+
 # --------------------------------------------------------------------------
 # Setup screen (shown once, before a trip exists)
 # --------------------------------------------------------------------------
@@ -211,95 +242,86 @@ def render_setup_screen():
     st.markdown('<div class="wf-eyebrow">Wayfare</div>', unsafe_allow_html=True)
     st.title("🧭 Plan your next trip's budget")
     st.write(
-        "Set up your trip once — name, total budget, base currency, and duration — "
-        "then track every expense against it as you go."
+        "Set up your trip once — name, home currency, destination currency, "
+        "total budget, and duration — then track every expense against it as you go."
     )
 
     st.markdown("<hr class='wf-divider'>", unsafe_allow_html=True)
 
-    with st.form("setup_form"):
-        col1, col2 = st.columns([2, 1])
-        with col1:
-            trip_name = st.text_input("Trip name", placeholder="e.g. Lisbon Summer 2026")
-        with col2:
-            base_currency = st.selectbox("Base currency", COMMON_CURRENCIES, index=0)
-
-        col3, col4 = st.columns([1, 1])
-        with col3:
-            total_budget = st.number_input(
-                "Total budget", min_value=0.0, step=50.0, format="%.2f"
-            )
-        with col4:
-            duration_days = st.number_input(
-                "Trip duration (days)", min_value=1, step=1, value=7
-            )
-
-        submitted = st.form_submit_button("Start planning →", use_container_width=True)
-
-        if submitted:
-            if not trip_name.strip():
-                st.error("Please give your trip a name.")
-            elif total_budget <= 0:
-                st.error("Total budget must be greater than zero.")
-            else:
-                try:
-                    st.session_state.trip = TripBudget(
-                        trip_name=trip_name.strip(),
-                        total_budget=total_budget,
-                        base_currency=base_currency,
-                        duration_days=int(duration_days),
-                    )
-                    st.session_state.trip_duration = int(duration_days)
-                    mark_stale()
-                    st.rerun()
-                except WayfareError as e:
-                    st.error(f"Couldn't start your trip: {e}")
-                except ValueError as e:
-                    st.error(f"Couldn't start your trip: {e}")
-
-    st.markdown("<hr class='wf-divider'>", unsafe_allow_html=True)
-    render_currency_converter_section()
-
-
-def render_currency_converter_section():
-    """Standalone live currency converter, available before a trip is set up."""
-    st.markdown('<div class="wf-eyebrow">Quick tool</div>', unsafe_allow_html=True)
-    st.subheader("💱 Convert your currency")
-    st.caption("Check what your money is worth at your destination before you plan your budget.")
-
-    try:
-        converter = CurrencyConverter()
-    except ValueError as e:
-        st.warning(f"Currency converter unavailable: {e}")
-        st.caption("Add an EXCHANGE_RATE_API_KEY to your .env file to enable this tool.")
-        return
-
-    col1, col2, col3 = st.columns([1, 1, 1])
+    # These live outside an st.form on purpose: a form only updates its
+    # values (and reruns the script) when the submit button is pressed, but
+    # we want the destination-currency preview below to update live as the
+    # amount/currencies change, with no separate "Convert" button needed.
+    col1, col2 = st.columns([2, 1])
     with col1:
-        amount = st.number_input(
-            "Amount", min_value=0.0, step=10.0, format="%.2f", key="converter_amount"
+        trip_name = st.text_input(
+            "Trip name", placeholder="e.g. Lisbon Summer 2026", key="setup_trip_name"
         )
     with col2:
-        from_currency = st.selectbox("From", COMMON_CURRENCIES, index=0, key="converter_from")
-    with col3:
-        to_currency = st.selectbox("To", COMMON_CURRENCIES, index=1, key="converter_to")
+        duration_days = st.number_input(
+            "Trip duration (days)", min_value=1, step=1, value=7, key="setup_duration_days"
+        )
 
-    if st.button("Convert", key="convert_btn", use_container_width=True):
-        if amount <= 0:
-            st.error("Enter an amount greater than zero.")
-        elif from_currency == to_currency:
-            st.info(f"{amount:.2f} {from_currency} is the same in {to_currency}.")
+    col3, col4 = st.columns([1, 1])
+    with col3:
+        home_currency = st.selectbox(
+            "Home currency", COMMON_CURRENCIES, index=0, key="setup_home_currency"
+        )
+    with col4:
+        destination_currency = st.selectbox(
+            "Destination currency", COMMON_CURRENCIES, index=1, key="setup_destination_currency"
+        )
+
+    total_budget = st.number_input(
+        "Total budget (in your home currency)",
+        min_value=0.0, step=50.0, format="%.2f", key="setup_total_budget",
+    )
+
+    # Live preview: what the budget is worth at the destination, recomputed
+    # automatically on every change above - no "Convert" button to click.
+    if home_currency == destination_currency:
+        st.caption("Home and destination currency are the same, so no conversion is needed.")
+    elif total_budget > 0:
+        try:
+            rate = _cached_exchange_rate(home_currency, destination_currency)
+        except WayfareError as e:
+            st.caption(f"Live conversion unavailable right now: {e}")
+        except ValueError as e:
+            st.caption(f"Live conversion unavailable right now: {e}")
         else:
-            with st.spinner("Fetching the latest rate..."):
-                try:
-                    result = converter.convert(amount, from_currency, to_currency)
-                    st.success(
-                        f"{result['original_amount']:.2f} {result['base_currency']} "
-                        f"= **{result['converted_amount']:.2f} {result['target_currency']}** "
-                        f"(rate: 1 {result['base_currency']} = {result['rate']:.4f} {result['target_currency']})"
-                    )
-                except Exception as e:
-                    st.error(f"Couldn't fetch the exchange rate: {e}")
+            converted = round(total_budget * rate, 2)
+            st.markdown(
+                f"💱 **{total_budget:,.2f} {home_currency} ≈ {converted:,.2f} {destination_currency}** "
+                f"at your destination &nbsp;<span style='color:#8A8276;font-size:0.85em;'>"
+                f"(1 {home_currency} = {rate:.4f} {destination_currency})</span>",
+                unsafe_allow_html=True,
+            )
+    else:
+        st.caption("Enter a budget above to see what it's worth at your destination.")
+
+    st.markdown("<hr class='wf-divider'>", unsafe_allow_html=True)
+
+    if st.button("Start planning →", use_container_width=True):
+        if not trip_name.strip():
+            st.error("Please give your trip a name.")
+        elif total_budget <= 0:
+            st.error("Total budget must be greater than zero.")
+        else:
+            try:
+                st.session_state.trip = TripBudget(
+                    trip_name=trip_name.strip(),
+                    total_budget=total_budget,
+                    base_currency=home_currency,
+                    duration_days=int(duration_days),
+                )
+                st.session_state.trip_duration = int(duration_days)
+                st.session_state.destination_currency = destination_currency
+                mark_stale()
+                st.rerun()
+            except WayfareError as e:
+                st.error(f"Couldn't start your trip: {e}")
+            except ValueError as e:
+                st.error(f"Couldn't start your trip: {e}")
 
 
 # --------------------------------------------------------------------------
@@ -311,18 +333,77 @@ def render_sidebar():
     st.sidebar.markdown('<div class="wf-eyebrow">Current trip</div>', unsafe_allow_html=True)
     st.sidebar.markdown(f"### {trip.trip_name}")
     st.sidebar.caption(
-        f"Base currency: {trip.base_currency} · "
+        f"Home currency: {trip.base_currency} → "
+        f"Destination: {st.session_state.destination_currency} · "
         f"Duration: {st.session_state.trip_duration} day(s)"
     )
 
     st.sidebar.markdown("<hr class='wf-divider'>", unsafe_allow_html=True)
+    st.sidebar.subheader("⚡ Quick add")
+    st.sidebar.caption(
+        "Type an expense naturally and we'll pull out the amount and currency "
+        "for you — e.g. \"1,200 NGN hotel deposit\" or \"about 45.50 USD lunch\"."
+    )
+
+    # The expense form fields below use a versioned key suffix (exp_amount_0,
+    # exp_amount_1, ...). Streamlit forbids writing to st.session_state[key]
+    # for a widget that's already rendered in the current script run, so the
+    # only way to either pre-fill the form (from quick add) or clear it
+    # (after a successful submit) is to bump this version and let the next
+    # rerun create fresh widgets under new, currently-unset keys.
+    form_version = st.session_state.expense_form_version
+
+    quick_text = st.sidebar.text_input(
+        "Quick add",
+        placeholder="e.g. 1,200 NGN hotel deposit",
+        key=f"quick_add_text_{st.session_state.quick_add_version}",
+        label_visibility="collapsed",
+    )
+    if st.sidebar.button("✨ Parse into form", key="quick_add_btn", use_container_width=True):
+        if not quick_text.strip():
+            st.sidebar.warning("Type something first, e.g. '45.50 USD lunch'.")
+        else:
+            price = extract_price_from_text(quick_text)
+            currency_code = extract_currency_code_from_text(quick_text, known_codes=COMMON_CURRENCIES)
+
+            if price is None and currency_code is None:
+                st.sidebar.warning(
+                    "Couldn't find an amount or a known currency code in that "
+                    "text — try the form below instead."
+                )
+            else:
+                # These exp_*_<form_version> keys haven't been instantiated
+                # yet this run (the form widgets are created further below),
+                # so writing to them here is allowed.
+                if price is not None:
+                    st.session_state[f"exp_amount_{form_version}"] = price
+                if currency_code is not None:
+                    st.session_state[f"exp_currency_{form_version}"] = currency_code
+
+                # Strip the matched price/currency tokens out of the text to
+                # leave a clean description guess for the description field.
+                desc_guess = PRICE_PATTERN.sub("", quick_text)
+                if currency_code is not None:
+                    desc_guess = re.sub(rf"\b{currency_code}\b", "", desc_guess, flags=re.IGNORECASE)
+                desc_guess = re.sub(r"\s{2,}", " ", desc_guess).strip(" ,.-")
+                st.session_state[f"exp_description_{form_version}"] = desc_guess or quick_text.strip()
+
+                st.session_state.quick_add_version += 1
+                st.sidebar.success("Parsed — review and confirm below.")
+                st.rerun()
+
+    st.sidebar.markdown("<hr class='wf-divider'>", unsafe_allow_html=True)
     st.sidebar.subheader("➕ Add an expense")
 
-    with st.sidebar.form("expense_form", clear_on_submit=True):
-        description = st.text_input("Description", placeholder="e.g. Hotel deposit")
-        amount = st.number_input("Amount", min_value=0.0, step=1.0, format="%.2f")
-        currency = st.selectbox("Currency", COMMON_CURRENCIES, index=0)
-        category = st.selectbox("Category", CATEGORIES)
+    with st.sidebar.form("expense_form", clear_on_submit=False):
+        description = st.text_input(
+            "Description", placeholder="e.g. Hotel deposit", key=f"exp_description_{form_version}"
+        )
+        amount = st.number_input(
+            "Amount", min_value=0.0, step=1.0, format="%.2f", key=f"exp_amount_{form_version}"
+        )
+        currency = st.selectbox("Currency", COMMON_CURRENCIES, key=f"exp_currency_{form_version}")
+        category = st.selectbox("Category", CATEGORIES, key=f"exp_category_{form_version}")
 
         add_clicked = st.form_submit_button("Add expense", use_container_width=True)
 
@@ -336,6 +417,11 @@ def render_sidebar():
                     trip.add_expense(description.strip(), amount, currency, category)
                     mark_stale()
                     st.sidebar.success(f"Added: {description.strip()}")
+                    # Bump the version instead of resetting these keys
+                    # directly - the widgets above already rendered with
+                    # the current version's keys this run, so writing to
+                    # them now would raise a StreamlitAPIException.
+                    st.session_state.expense_form_version += 1
                     st.rerun()
                 except WayfareError as e:
                     st.sidebar.error(f"Couldn't add expense: {e}")
@@ -344,6 +430,9 @@ def render_sidebar():
     if st.sidebar.button("🔁 Start a new trip", use_container_width=True):
         st.session_state.trip = None
         st.session_state.trip_duration = 7
+        st.session_state.destination_currency = COMMON_CURRENCIES[1]
+        st.session_state.quick_add_version = 0
+        st.session_state.expense_form_version = 0
         st.session_state.summary_cache = None
         st.session_state.summary_stale = True
         st.rerun()

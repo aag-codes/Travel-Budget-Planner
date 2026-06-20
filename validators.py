@@ -56,7 +56,7 @@ def extract_price_from_text(text: str) -> float | None:
         return None
 
 
-def extract_currency_code_from_text(text: str, known_codes: set[str] | None = None) -> str | None:
+def extract_currency_code_from_text(text: str, known_codes: list[str] | None = None) -> str | None:
     """
     Extracts the first 3-letter currency-code-shaped token from free text,
     e.g. "1200 NGN for the hotel" -> "NGN". Returns None if none found.
