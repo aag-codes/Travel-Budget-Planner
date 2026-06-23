@@ -95,7 +95,7 @@ class CurrencyConverter:
             "converted_amount": converted,
         }
 
-    def get_supported_currencies(self) -> list:
+    def get_supported_currencies(self) -> list[dict[str,str]]:
         """Returns a list of all supported currency codes."""
         url = f"{self.BASE_URL}/{self.api_key}/codes"
         data = self._get(url)

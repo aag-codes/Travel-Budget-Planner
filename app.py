@@ -366,7 +366,7 @@ def render_sidebar():
             price = extract_price_from_text(quick_text)
             currency_code = extract_currency_code_from_text(quick_text, known_codes=COMMON_CURRENCIES)
 
-            if price is None and currency_code is None:
+            if price is None or currency_code is None:
                 st.sidebar.warning(
                     "Couldn't find an amount or a known currency code in that "
                     "text — try the form below instead."

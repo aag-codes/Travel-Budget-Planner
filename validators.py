@@ -1,5 +1,3 @@
-# validators.py
-
 import re
 
 # Three uppercase letters, e.g. USD, NGN, GBP. Case-insensitive on input,
